@@ -1,0 +1,177 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from nets.model import u2net_full,u2net_prune_l
+from scipy.stats import norm
+
+# Load the weights of the U2Net
+model = u2net_full(out_ch=8)  
+state_dict = torch.load(
+    r"path of the weight file", map_location='cpu'
+)
+model.load_state_dict(state_dict, strict=False)
+
+# The number of parameters in BN layers
+total = []  
+bn_data = []
+
+# The number of parameters in convolution layers
+total1 = []  
+conv_data1 = []
+
+thresh_all = []
+i = 0
+n = 0
+
+# Probability density function
+def norm_dist_prob(theta):
+    y = norm.pdf(theta, loc=0, scale=1)
+    return y
+
+# Cumulative density function
+def norm_dist_cdf(theta):
+    y = norm.cdf(theta,loc=0,scale=1)
+    return y
+
+for m in model.modules(): 
+    # Absolute value of convolutional layer: S1         
+    if isinstance(m,nn.Conv2d):
+        if n<=111:
+            total1.append(m.weight.data.shape[0])
+            conv=torch.zeros(total1[n])
+            conv_data1.append(conv)
+            conv_data1[n]=m.weight.data.abs().clone().sum(axis=[1,2,3])
+            
+    # Expectation of truncated Gaussian distribution: S2 
+    if isinstance(m, nn.BatchNorm2d):
+        total.append(m.weight.data.shape[0])
+        bn=torch.zeros(total[i])
+        bn_data.append(bn)
+        b=-(m.bias.data.clone())/(m.weight.data.abs().clone())
+        bn_data[i]=(m.bias.data.clone())-(m.weight.data.abs().clone())*((-norm_dist_prob(b))/(1- norm_dist_cdf(b)+0.00001))
+        # S1*S2
+        bn_data[i]= conv_data1[n]*bn_data[i]
+        data,id=torch.sort(bn_data[i])
+        
+        #layer-level pruning ratio
+        percent=0.875               
+        thresh_index=int(total[i]*percent)
+        # Set thresh
+        thresh=data[thresh_index-1]
+        thresh_all.append(thresh)
+        i = i + 1
+        n = n + 1
+ 
+# Create mask
+# The pruned channel is marked as 0, and the reserved channel is marked as 1
+
+# The number of the pruned channels
+pruned_num=0
+# The number of the reserved channels
+cfg=[]
+# The set of the masks
+cfg_mask=[]
+pruned_ratio=[]
+
+for k,m in enumerate(model.modules()):
+    # Absolute value of convolutional layer: S1    
+    if isinstance(m,nn.Conv2d):
+        weight_conv=m.weight.data.abs().clone().sum(axis=[1,2,3])
+    
+    # Expectation of truncated Gaussian distribution: S2 
+    if isinstance(m,nn.BatchNorm2d):
+        b=-(m.bias.data.clone())/(m.weight.data.abs().clone())
+        weight_bn=(m.bias.data.clone())-(m.weight.data.abs().clone())*((-norm_dist_prob(b))/(1- norm_dist_cdf(b)+0.00001))
+        # S1*S2
+        weight_copy=weight_conv*weight_bn
+        mask=weight_copy.gt(thresh_all[v]).float()
+        pruned_num=mask.shape[0]-torch.sum(mask)
+        pruned_num=int(pruned_num)
+        
+        cfg.append(int(torch.sum(mask)))
+        cfg_mask.append(mask.clone())
+        pruned_ratio.append(pruned_num/total[v])
+
+    elif isinstance(m,nn.AvgPool2d):
+        cfg.append("A")
+
+# Load the U2Net with small structure
+newmodel=u2net_prune_l(out_ch=8)  
+ 
+layer_id_in_cfg=0
+start_mask=torch.ones(3)
+# The mask of the first layer
+end_mask=cfg_mask[layer_id_in_cfg]
+
+q=0
+p=[59, 67, 75, 85, 97, 111]
+for(m0,m1)in zip(model.modules(),newmodel.modules()):#
+
+    if isinstance(m0,nn.BatchNorm2d):
+        # Get the sequence number of the non-zero index in the mask
+        idx1=np.squeeze(np.argwhere(np.asarray(end_mask.numpy())))
+    
+        if idx1.size==1:
+            idx1=np.resize(idx1,(1,))
+
+        # Copy the parameter values of the old model to the new model
+        m1.weight.data=m0.weight.data[idx1.tolist()].clone()
+        m1.bias.data=m0.bias.data[idx1.tolist()].clone()
+        m1.running_mean=m0.running_mean[idx1.tolist()].clone()
+        m1.running_var = m0.running_var[idx1.tolist()].clone()
+        
+        # Next mask
+        layer_id_in_cfg+=1#
+        start_mask=end_mask.clone()
+        if layer_id_in_cfg<len(cfg_mask):
+            end_mask=cfg_mask[layer_id_in_cfg]
+
+    if isinstance(m0,nn.Conv2d):
+        
+        # Encoder and decoder part of U2Net
+        if q<112:
+            # Encoder part
+            if q <=7 or 14<=q<=20 or 26<=q<=31 or 36<=q<=40 or 44<=q<=48 or 52<=q<=56 or 61<=q<=64 or 69<=q<=72 or 77<=q<=81 or 87<=q<=92 or 99<=q<=105:
+                idx0=np.squeeze(np.argwhere(np.asarray(start_mask.numpy())))
+                idx1=np.squeeze(np.argwhere(np.asarray(end_mask.numpy()))) 
+                   
+                if idx0.size==1:
+                    idx0=np.resize(idx0,(1,))
+                if idx1.size==1:
+                    idx1=np.resize(idx1,(1,))
+
+                w1=m0.weight.data[:,idx0.tolist(),:,:].clone()
+                w1=w1[idx1.tolist(),:,:,:].clone()
+                m1.weight.data=w1.clone()
+                q=q+1
+
+            # Decoder part
+            else:
+                p1=[6,5,4,3,2,1,  19,18,17,16,15,  30,29,28,27,  39,38,37,  47,46,45,  55,54,53,  51,  63,62,61,  43,  71,70,69,  35,  80,79,78,77,  25,  91,90,89,88,87,   13,  104,103,102,101,100,99]
+                qq=np.asarray(start_mask.numpy())
+                ww= np.asarray((cfg_mask[p1[z]]).numpy())
+                idx0=np.squeeze(np.argwhere(np.append(qq,ww)))
+                idx1=np.squeeze(np.argwhere(np.asarray(end_mask.numpy())))    
+
+                if idx0.size==1:
+                    idx0=np.resize(idx0,(1,))
+                if idx1.size==1:
+                    idx1=np.resize(idx1,(1,))
+
+                w1=m0.weight.data[:,idx0.tolist(),:,:].clone()
+                w1=w1[idx1.tolist(),:,:,:].clone()
+                m1.weight.data=w1.clone()
+                q=q+1
+
+        # Feature fusion module
+        else:
+            if q <118:
+                idx1=np.squeeze(np.argwhere(np.asarray(cfg_mask[p[o]].numpy())))
+                w1=m0.weight.data[:,idx1.tolist(),:,:].clone()
+                m1.weight.data=w1.clone()
+                q=q+1
+            else:
+                m1.weight.data=m0.weight.data.clone()
+ 
+torch.save(newmodel.state_dict(),"the path of the pruned model") 
+print('Finish')
