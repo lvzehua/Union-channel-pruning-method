@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from nets.model import u2net_full,u2net_prune_l
+from nets.model import u2net_full,u2net_prune_l，u2net_prune_l_s, u2net_prune_m, u2net_prune_m_s, u2net_prune_mm, u2net_prune_mm_s, u2net_prune_s
 from scipy.stats import norm
 
 # Load the weights of the U2Net
