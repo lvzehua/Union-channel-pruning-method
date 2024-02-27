@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from nets.model import u2net_full,u2net_prune_l
+from scipy.stats import norm
+
+# Load the weights of the U2Net
+model = u2net_full(out_ch=8)  
+state_dict = torch.load(
+    r"path of the weight file", map_location='cpu'
+)
+model.load_state_dict(state_dict, strict=False)
+
+# The number of parameters in BN layers
+total = []  
+bn_data = []
+
+# The number of parameters in convolution layers
+total1 = []  
+conv_data1 = []
+
+thresh_all = []
+i = 0
+n = 0
+
+# Probability density function
+def norm_dist_prob(theta):
+    y = norm.pdf(theta, loc=0, scale=1)
+    return y
+
+# Cumulative density function
+def norm_dist_cdf(theta):
+    y = norm.cdf(theta,loc=0,scale=1)
+    return y
+
+for m in model.modules(): 
+    # Absolute value of convolutional layer: S1         
+    if isinstance(m,nn.Conv2d):
+        if n<=111:
+            total1.append(m.weight.data.shape[0])
+            conv=torch.zeros(total1[n])
+            conv_data1.append(conv)
+            conv_data1[n]=m.weight.data.abs().clone().sum(axis=[1,2,3])
+            
+    # Expectation of truncated Gaussian distribution: S2 
+    if isinstance(m, nn.BatchNorm2d):
+        total.append(m.weight.data.shape[0])
+        bn=torch.zeros(total[i])
+        bn_data.append(bn)
+        b=-(m.bias.data.clone())/(m.weight.data.abs().clone())
+        bn_data[i]=(m.bias.data.clone())-(m.weight.data.abs().clone())*((-norm_dist_prob(b))/(1- norm_dist_cdf(b)+0.00001))
+        # S1*S2
+        bn_data[i]= conv_data1[n]*bn_data[i]
+        data,id=torch.sort(bn_data[i])
+        
+        #layer-level pruning ratio
+        percent=0.875               
+        thresh_index=int(total[i]*percent)
+        # Set thresh
+        thresh=data[thresh_index-1]
+        thresh_all.append(thresh)
+        i = i + 1
+        n = n + 1
+ 
+# Create mask
+# The pruned channel is marked as 0, and the reserved channel is marked as 1
+
+# The number of the pruned channels
+pruned_num=0
+# The number of the reserved channels
+cfg=[]
+# The set of the masks
+cfg_mask=[]
+pruned_ratio=[]
+
+for k,m in enumerate(model.modules()):
+    # Absolute value of convolutional layer: S1    
+    if isinstance(m,nn.Conv2d):
+        weight_conv=m.weight.data.abs().clone().sum(axis=[1,2,3])
+    
+    # Expectation of truncated Gaussian distribution: S2 
+    if isinstance(m,nn.BatchNorm2d):
+        b=-(m.bias.data.clone())/(m.weight.data.abs().clone())
+        weight_bn=(m.bias.data.clone())-(m.weight.data.abs().clone())*((-norm_dist_prob(b))/(1- norm_dist_cdf(b)+0.00001))
+        # S1*S2
+        weight_copy=weight_conv*weight_bn
+        mask=weight_copy.gt(thresh_all[v]).float()
+        pruned_num=mask.shape[0]-torch.sum(mask)
+        pruned_num=int(pruned_num)
+        
+        cfg.append(int(torch.sum(mask)))
+        cfg_mask.append(mask.clone())
+        pruned_ratio.append(pruned_num/total[v])
+
+    elif isinstance(m,nn.AvgPool2d):
+        cfg.append("A")
+
+# Load the U2Net with small structure
+newmodel=u2net_prune_l(out_ch=8)  
